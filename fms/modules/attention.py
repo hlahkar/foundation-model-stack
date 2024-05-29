@@ -15,6 +15,51 @@ from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
 
 
+class GaudiRotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        super().__init__()
+
+        self.scaling_factor = scaling_factor
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("_cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("_sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self._cos_cached[:seq_len].to(dtype=x.dtype),
+            self._sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV2 as FusedRoPE
+
+def apply_customized_rope(q, k, cos, sin, position_ids):
+    return FusedRoPE.apply(
+        q, cos.unsqueeze(0).unsqueeze(0).clone(), sin.unsqueeze(0).unsqueeze(0).clone(), position_ids
+    ), FusedRoPE.apply(
+        k, cos.unsqueeze(0).unsqueeze(0).clone(), sin.unsqueeze(0).unsqueeze(0).clone(), position_ids
+    )
+
+
 class MultiHeadAttention(nn.Module):
     """
     Performs multi-headed self- or cross-attention, with optional attention masking.
@@ -78,6 +123,11 @@ class MultiHeadAttention(nn.Module):
             torch.backends.cuda.mem_efficient_sdp_enabled()
         )
         self.previous_math: bool = torch.backends.cuda.math_sdp_enabled()
+        self.rotary_emb = GaudiRotaryEmbedding(
+                self.emb_dim // self.nheads,
+                self.emb_dim,
+                base=10000.0
+            )
 
     def reset_parameters(self):
         for m in self.modules():
@@ -132,31 +182,64 @@ class MultiHeadAttention(nn.Module):
             batch_size, q_len, self.nheads, self.emb_kq_per_head
         )
 
-        # if this is self attention, we always recompute
-        # cross attention only gets computed when a cache does not exist
-        # if we dont have the cache yet, we need to compute
-        # d x (h x ds)
-        # b x kvlen x d
-        # b x kvlen x h x ds
-        # b x h x kvlen x ds
-        if is_self or past_key_value_state is None:
-            keys = self.key(k).view(
-                batch_size, kv_len, self.kvheads, self.emb_kq_per_head
-            )
+        if queries.device.type == 'hpu':
+            queries = queries.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
 
-            values = self.value(v).view(
-                batch_size, kv_len, self.kvheads, self.emb_v_per_head
-            )
-
-            # You want to apply rotary embeddings pre-cache
-            if self.position_encoder is not None:
-                queries, keys = self.position_encoder.adjusted_qk(
-                    queries, keys, position_ids, past_key_value_state, use_cache
+            # if this is self attention, we always recompute
+            # cross attention only gets computed when a cache does not exist
+            # if we dont have the cache yet, we need to compute
+            # d x (h x ds)
+            # b x kvlen x d
+            # b x kvlen x h x ds
+            # b x h x kvlen x ds
+            if is_self or past_key_value_state is None:
+                keys = self.key(k).view(
+                    batch_size, kv_len, self.kvheads, self.emb_kq_per_head
                 )
 
-        queries = queries.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
-        keys = keys.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
-        values = values.transpose(2, 1)  # compatible with QK.T
+                values = self.value(v).view(
+                    batch_size, kv_len, self.kvheads, self.emb_v_per_head
+                )
+
+                keys = keys.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
+                values = values.transpose(2, 1)  # compatible with QK.T
+
+                # You want to apply rotary embeddings pre-cache
+                if self.position_encoder is not None:
+                    if position_ids is None:
+                        position_ids = torch.arange(
+                            0, keys.shape[2], dtype=torch.long, device=queries.device
+                        )
+                        position_ids = position_ids.reshape(1, keys.shape[2])
+                    cos, sin = self.rotary_emb(values, keys.shape[2])
+                    queries, keys = apply_customized_rope(queries, keys, cos, sin, position_ids)
+        else:
+            # if this is self attention, we always recompute
+            # cross attention only gets computed when a cache does not exist
+            # if we dont have the cache yet, we need to compute
+            # d x (h x ds)
+            # b x kvlen x d
+            # b x kvlen x h x ds
+            # b x h x kvlen x ds
+            if is_self or past_key_value_state is None:
+                keys = self.key(k).view(
+                    batch_size, kv_len, self.kvheads, self.emb_kq_per_head
+                )
+
+                values = self.value(v).view(
+                    batch_size, kv_len, self.kvheads, self.emb_v_per_head
+                )
+
+                # You want to apply rotary embeddings pre-cache
+                if self.position_encoder is not None:
+                    queries, keys = self.position_encoder.adjusted_qk(
+                        queries, keys, position_ids, past_key_value_state, use_cache
+                    )
+
+            queries = queries.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
+            keys = keys.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
+            values = values.transpose(2, 1)  # compatible with QK.T
+
 
         # if you want to use caching and past_key_value_state is not None meaning you have values in your cache
         if (
@@ -197,29 +280,44 @@ class MultiHeadAttention(nn.Module):
             keys_e = keys
             values_e = values
 
-        if attn_algorithm:
-            # Pick which fused attn kernels will run.
-            use_flash = attn_algorithm == "flash"
-            use_mem_efficient = attn_algorithm == "mem"
-            use_math = attn_algorithm == "math"
+        if queries.device.type == 'hpu':
+            from habana_frameworks.torch.hpex.kernels import FusedSDPA
+            import habana_frameworks.torch.hpu as ht
+            with ht.sdp_kernel(enable_recompute=True):
+                attn = FusedSDPA.apply(queries,
+                    keys_e,
+                    values_e,
+                    attn_mask,
+                    self.p_dropout if self.training else 0.0,
+                    is_causal_mask,
+                    None,
+                    'fast'
+                )
+        else:
+            if attn_algorithm:
+                # Pick which fused attn kernels will run.
+                use_flash = attn_algorithm == "flash"
+                use_mem_efficient = attn_algorithm == "mem"
+                use_math = attn_algorithm == "math"
 
-            torch.backends.cuda.enable_flash_sdp(use_flash)
-            torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
-            torch.backends.cuda.enable_math_sdp(use_math)
+                torch.backends.cuda.enable_flash_sdp(use_flash)
+                torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
+                torch.backends.cuda.enable_math_sdp(use_math)
 
-        attn = F.scaled_dot_product_attention(
-            queries,
-            keys_e,
-            values_e,
-            attn_mask=attn_mask,
-            dropout_p=self.p_dropout if self.training else 0.0,
-            is_causal=is_causal_mask,
-        )
+            attn = F.scaled_dot_product_attention(
+                queries,
+                keys_e,
+                values_e,
+                attn_mask=attn_mask,
+                dropout_p=self.p_dropout if self.training else 0.0,
+                is_causal=is_causal_mask,
+            )
 
-        if attn_algorithm:
-            torch.backends.cuda.enable_flash_sdp(self.previous_flash)
-            torch.backends.cuda.enable_mem_efficient_sdp(self.previous_mem_efficient)
-            torch.backends.cuda.enable_math_sdp(self.previous_math)
+            if attn_algorithm:
+                torch.backends.cuda.enable_flash_sdp(self.previous_flash)
+                torch.backends.cuda.enable_mem_efficient_sdp(self.previous_mem_efficient)
+                torch.backends.cuda.enable_math_sdp(self.previous_math)
+        
 
         # attn: bs x seq_len x nheads*emb_v_per_head
         # attn: b x h x qlen x ds
